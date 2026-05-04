@@ -96,7 +96,6 @@ def check_ecommerce_optimized(base_url):
     API_KEY = "60730861602c4b7fb98ec93607035e7d"
     
     with sync_playwright() as p:
-        # RIMOSSO IL PROXY DI RETE CHE CAUSAVA IL BLOCCO IP. Bypassiamo via URL.
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -115,19 +114,18 @@ def check_ecommerce_optimized(base_url):
             page = context.new_page()
             
             try:
-                # CREAZIONE DELL'URL BYPASS
+                # ABBIAMO AGGIUNTO IL PARAMETRO premium=true
                 encoded_base_url = quote(base_url)
-                # Chiediamo a ScraperAPI di fare il lavoro sporco con render=true
-                bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={encoded_base_url}&render=true&country_code=it"
+                bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={encoded_base_url}&render=true&premium=true&country_code=it"
                 
-                page.goto(bypass_url, timeout=60000, wait_until="domcontentloaded")
+                # I server premium ci mettono un attimo in più a risolvere, diamo 90 secondi
+                page.goto(bypass_url, timeout=90000, wait_until="domcontentloaded")
                 page.wait_for_timeout(3000) 
                 
                 page_title = page.title()
                 homepage_html = page.content()
                 combined_html += homepage_html
                 
-                # ESTRAZIONE LINK A PROVA DI BOMBA (Prendiamo il parametro href grezzo)
                 raw_links = page.evaluate("""() => {
                     return Array.from(document.querySelectorAll('a')).map(a => a.getAttribute('href')).filter(h => h);
                 }""")
@@ -142,7 +140,6 @@ def check_ecommerce_optimized(base_url):
                     if href_lower == base_url.lower() or href_lower == '/': continue
                     
                     if any(k in href_lower for k in keywords) or (href_lower.endswith('.html') and len(href) > 20):
-                        # Ricostruiamo l'URL originale di Sephora, unendo la base corretta all'href
                         valid_links.append(urljoin(base_url, href))
                 
                 product_links = list(set(valid_links))[:2]
@@ -162,10 +159,11 @@ def check_ecommerce_optimized(base_url):
                 
             for p_url in product_links:
                 try:
+                    # AGGIUNTO premium=true ANCHE AI PRODOTTI
                     encoded_p_url = quote(p_url)
-                    p_bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={encoded_p_url}&render=true&country_code=it"
+                    p_bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={encoded_p_url}&render=true&premium=true&country_code=it"
                     
-                    page.goto(p_bypass_url, timeout=60000, wait_until="domcontentloaded")
+                    page.goto(p_bypass_url, timeout=90000, wait_until="domcontentloaded")
                     page.wait_for_timeout(4000) 
                     combined_html += page.content()
                 except Exception as e:
@@ -183,7 +181,7 @@ def check_ecommerce_optimized(base_url):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "✅ Server VIVO e API BYPASS ATTIVATO."
+    return "✅ Server VIVO e PREMIUM PROXY ATTIVATI."
 
 @app.route('/api/check', methods=['POST'])
 @app.route('/api/check/', methods=['POST'])
