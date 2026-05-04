@@ -18,37 +18,52 @@ def extract_products(html, base_url):
     soup = BeautifulSoup(html, "html.parser")
     links = []
     
-    # 1. Parole chiave inequivocabili negli URL
-    keywords = ['/product/', '/products/', '/prodotto/', '/prodotti/', '/p/', '/item/', '/sku/']
+    # Keyword classiche (incluso pattern Sephora e Salesforce)
+    keywords = ['/product/', '/products/', '/prodotto/', '/prodotti/', '/p/', '/item/', '/sku/', '-p-']
     
-    # 2. Pagine da ignorare categoricamente
-    exclude = ['/cart', '/login', '/account', '/contact', '/checkout', '/wishlist', '/category/', '/brand/']
+    # Pagine da escludere assolutamente (per evitare di finire nel carrello o privacy)
+    exclude = ['/cart', '/login', '/account', '/contact', '/checkout', '/wishlist', '/category/', '/brand/', '/privacy', '/terms', '/faq', '/store-locator', '/resi', '/categorie/']
+    
+    valid_anchors = []
     
     for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
+        href = a.get("href", "").strip()
         href_lower = href.lower()
         
-        # Ignora ancore interne o link inutili
-        if href.startswith('#') or href.startswith('javascript:'):
+        # Ignora ancore interne o script
+        if href.startswith('#') or href.startswith('javascript:') or href.startswith('mailto:'):
             continue
             
         if any(ex in href_lower for ex in exclude):
             continue
             
-        # Match Diretto (ha la parola chiave)
-        if any(k in href_lower for k in keywords):
-            links.append(urljoin(base_url, href))
+        full_url = urljoin(base_url, href)
+        
+        # Ignora i link che rimandano alla homepage stessa
+        if full_url.rstrip('/') == base_url.rstrip('/'):
             continue
             
-        # Match Euristico: Se il link ha molti trattini, al 90% è uno "slug" di prodotto SEO-friendly
-        if href.count('-') >= 3 and len(href) > 25:
-            links.append(urljoin(base_url, href))
+        valid_anchors.append(full_url)
+        
+        # 1. Match Classico (Parole chiave)
+        if any(k in href_lower for k in keywords):
+            links.append(full_url)
+            continue
+            
+        # 2. Match Salesforce Commerce Cloud (Molti link finiscono in .html nudo e crudo)
+        if href_lower.endswith('.html') and len(href) > 20:
+            links.append(full_url)
+            
+    # 3. L'HACKER FALLBACK: La Teoria del Link Lungo
+    # Se i dev hanno nascosto tutto, ordiniamo i link per lunghezza. 
+    # I prodotti (es. /sauvage-eau-de-parfum-100ml-uomo-1234) sono sempre i più lunghi!
+    if not links and valid_anchors:
+        valid_anchors = list(set(valid_anchors))
+        valid_anchors.sort(key=len, reverse=True)
+        links = valid_anchors[:5] # Peschiamo dai 5 link più lunghi
 
-    # Pulizia duplicati e rimozione dell'URL base stesso
     unique_links = list(set(links))
-    unique_links = [l for l in unique_links if l.rstrip('/') != base_url.rstrip('/')]
-    
-    return unique_links[:2] # Prendi i primi 2
+    return unique_links[:2] # Ne restituiamo 2 per i test
 
 def detect_platform(html):
     if not html:
@@ -163,25 +178,40 @@ def check_ecommerce_optimized(base_url):
             context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             page = context.new_page()
             
-            # --- FASE 1: HOMEPAGE ---
+            # --- FASE 1: HOMEPAGE E RISVEGLIO PRODOTTI ---
             try:
                 page.goto(base_url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000) # Aspetta rendering JS
+                page.wait_for_timeout(2000) 
                 
-                # Cookie Killer: tenta di accettare i cookie subito
+                # Spara al banner dei cookie
                 try:
                     page.evaluate("""
                         const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
-                        const acceptBtn = buttons.find(b => b.innerText.match(/accetta|accept|agree|consenti|acconsento/i));
+                        const acceptBtn = buttons.find(b => b.innerText.match(/accetta|accept|agree|consenti|acconsento|tout accepter/i));
                         if(acceptBtn) acceptBtn.click();
                     """)
-                    page.wait_for_timeout(2000)
                 except:
                     pass
                 
-                # Scroll in homepage per forzare il caricamento lazy
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
-                page.wait_for_timeout(2000)
+                # LO SCROLL UMANO: Scorre dinamicamente giù per risvegliare i caroselli di Sephora
+                try:
+                    page.evaluate("""
+                        () => new Promise((resolve) => {
+                            let totalHeight = 0;
+                            let distance = 600;
+                            let timer = setInterval(() => {
+                                window.scrollBy(0, distance);
+                                totalHeight += distance;
+                                if(totalHeight >= document.body.scrollHeight || totalHeight > 6000){
+                                    clearInterval(timer);
+                                    window.scrollTo(0, 0);
+                                    resolve();
+                                }
+                            }, 250);
+                        })
+                    """)
+                except:
+                    page.wait_for_timeout(2000)
                 
                 homepage_html = page.content()
                 combined_html += homepage_html
@@ -189,18 +219,19 @@ def check_ecommerce_optimized(base_url):
                 error_log = f"Errore Homepage ({base_url}): {str(e)}"
                 return False, "Sconosciuta", error_log
                 
-            # --- FASE 2: ESTRAZIONE PRODOTTI ---
+            # --- FASE 2: CACCIA AI PRODOTTI ---
             product_links = extract_products(homepage_html, base_url)
             
             if not product_links:
                 error_log += " [ATTENZIONE: Nessun link prodotto trovato in Homepage!] "
             
-            # --- FASE 3: NAVIGAZIONE PRODOTTI ---
+            # --- FASE 3: ANALISI DEI PRODOTTI TROVATI ---
             for p_url in product_links:
                 try:
                     page.goto(p_url, timeout=30000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000) # Attesa cruciale per i widget recensioni (spesso lenti)
+                    page.wait_for_timeout(3000) # Aspettiamo che il widget Bazaarvoice di Sephora venga iniettato
                     
+                    # Scroll per risvegliare il widget delle recensioni a fondo pagina
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
                     page.wait_for_timeout(2000)
                     
