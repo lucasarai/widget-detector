@@ -1,6 +1,33 @@
 {
   "build": {
     "builder": "NIXPACKS",
+    "nixpacksPlan": {
+      "phases": {
+        "setup": {
+          "aptPkgs": [
+            "libgbm1",
+            "libx11-xcb1",
+            "libxcb-dri3-0",
+            "libxcomposite1",
+            "libxcursor1",
+            "libxdamage1",
+            "libxext6",
+            "libxfixes3",
+            "libxi6",
+            "libxrandr2",
+            "libxrender1",
+            "libxtst6",
+            "libnss3",
+            "libcups2",
+            "libxss1",
+            "libasound2",
+            "fonts-liberation",
+            "libatk-bridge2.0-0",
+            "libgtk-3-0"
+          ]
+        }
+      }
+    },
     "buildCommand": "pip install -r requirements.txt && playwright install chromium --with-deps"
   },
   "deploy": {
