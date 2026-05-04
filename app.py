@@ -17,12 +17,38 @@ PROVIDERS = [
 def extract_products(html, base_url):
     soup = BeautifulSoup(html, "html.parser")
     links = []
-    # Aggiunti pattern Enterprise: /p/ (Sephora), /item/
+    
+    # 1. Parole chiave inequivocabili negli URL
+    keywords = ['/product/', '/products/', '/prodotto/', '/prodotti/', '/p/', '/item/', '/sku/']
+    
+    # 2. Pagine da ignorare categoricamente
+    exclude = ['/cart', '/login', '/account', '/contact', '/checkout', '/wishlist', '/category/', '/brand/']
+    
     for a in soup.find_all("a", href=True):
-        href = a.get("href", "").lower()
-        if "/products/" in href or "/prodotto/" in href or "/p/" in href or "/item/" in href:
-            links.append(urljoin(base_url, a.get("href")))
-    return list(set(links))[:2] 
+        href = a.get("href", "")
+        href_lower = href.lower()
+        
+        # Ignora ancore interne o link inutili
+        if href.startswith('#') or href.startswith('javascript:'):
+            continue
+            
+        if any(ex in href_lower for ex in exclude):
+            continue
+            
+        # Match Diretto (ha la parola chiave)
+        if any(k in href_lower for k in keywords):
+            links.append(urljoin(base_url, href))
+            continue
+            
+        # Match Euristico: Se il link ha molti trattini, al 90% è uno "slug" di prodotto SEO-friendly
+        if href.count('-') >= 3 and len(href) > 25:
+            links.append(urljoin(base_url, href))
+
+    # Pulizia duplicati e rimozione dell'URL base stesso
+    unique_links = list(set(links))
+    unique_links = [l for l in unique_links if l.rstrip('/') != base_url.rstrip('/')]
+    
+    return unique_links[:2] # Prendi i primi 2
 
 def detect_platform(html):
     if not html:
@@ -40,7 +66,6 @@ def detect_platform(html):
         return "PrestaShop"
     if "cdn11.bigcommerce.com" in html_lower:
         return "BigCommerce"
-    # Aggiunto rilevamento Salesforce Commerce Cloud (Demandware) usato da Sephora
     if "demandware.store" in html_lower or "dw.acct" in html_lower or "salesforce" in html_lower:
         return "Salesforce Commerce Cloud"
         
@@ -131,44 +156,51 @@ def check_ecommerce_optimized(base_url):
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
-                device_scale_factor=1,
-                has_touch=False,
-                is_mobile=False,
                 locale="it-IT",
                 timezone_id="Europe/Rome"
             )
             
             context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            
             page = context.new_page()
             
+            # --- FASE 1: HOMEPAGE ---
             try:
                 page.goto(base_url, timeout=30000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000) # Aspetta rendering JS
+                
+                # Cookie Killer: tenta di accettare i cookie subito
+                try:
+                    page.evaluate("""
+                        const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+                        const acceptBtn = buttons.find(b => b.innerText.match(/accetta|accept|agree|consenti|acconsento/i));
+                        if(acceptBtn) acceptBtn.click();
+                    """)
+                    page.wait_for_timeout(2000)
+                except:
+                    pass
+                
+                # Scroll in homepage per forzare il caricamento lazy
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
                 page.wait_for_timeout(2000)
+                
                 homepage_html = page.content()
                 combined_html += homepage_html
             except Exception as e:
                 error_log = f"Errore Homepage ({base_url}): {str(e)}"
                 return False, "Sconosciuta", error_log
                 
+            # --- FASE 2: ESTRAZIONE PRODOTTI ---
             product_links = extract_products(homepage_html, base_url)
             
+            if not product_links:
+                error_log += " [ATTENZIONE: Nessun link prodotto trovato in Homepage!] "
+            
+            # --- FASE 3: NAVIGAZIONE PRODOTTI ---
             for p_url in product_links:
                 try:
                     page.goto(p_url, timeout=30000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(3000) # Attesa cruciale per i widget recensioni (spesso lenti)
                     
-                    # NOVITÀ: Tenta di cliccare un bottone "Accetta" (Cookie) per sbloccare la pagina
-                    try:
-                        page.evaluate("""
-                            const buttons = Array.from(document.querySelectorAll('button, a'));
-                            const acceptBtn = buttons.find(b => b.innerText.match(/accetta|accept|agree|consenti/i));
-                            if(acceptBtn) acceptBtn.click();
-                        """)
-                    except:
-                        pass # Se non trova il bottone, vai avanti tranquillo
-                    
-                    # NOVITÀ: Scroll della pagina verso il basso per attivare i widget "lazy loaded" (come quelli di Sephora/Bazaarvoice)
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
                     page.wait_for_timeout(2000)
                     
@@ -209,15 +241,14 @@ def api_single_check():
             'piattaforma': platform
         }
         if log:
-            response_data['internal_log'] = log
+            response_data['internal_log'] = log.strip()
             
         return jsonify(response_data)
     except Exception as e:
         return jsonify({
             'widget_presente': False,
             'piattaforma': 'Sconosciuta',
-            'error': str(e),
-            'traceback': traceback.format_exc()
+            'error': str(e)
         }), 500
 
 if __name__ == '__main__':
