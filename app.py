@@ -45,12 +45,28 @@ def detect(html):
     
     return False
 
+# --- NUOVA FUNZIONE: PLATFORM DETECTION ---
+def detect_platform(html):
+    if not html:
+        return "Sconosciuta"
+        
+    html_lower = html.lower()
+    
+    # Rilevamento tramite impronte digitali note (CDN, script, classi)
+    if "cdn.shopify.com" in html_lower or "window.shopify" in html_lower or "shopify.theme" in html_lower:
+        return "Shopify"
+    if "wp-content/plugins/woocommerce" in html_lower or "woocommerce-cart" in html_lower or "var woocommerce_params" in html_lower:
+        return "WooCommerce"
+    if "text/x-magento-init" in html_lower or "mage.cookies" in html_lower or "skin/frontend/" in html_lower:
+        return "Magento"
+    if "var prestashop" in html_lower or 'content="prestashop"' in html_lower:
+        return "PrestaShop"
+    if "cdn11.bigcommerce.com" in html_lower:
+        return "BigCommerce"
+        
+    return "Sconosciuta"
+
 def check_ecommerce_optimized(base_url):
-    """
-    Versione ottimizzata: apre Chromium UNA sola volta per dominio,
-    naviga la home e i prodotti sfruttando la stessa istanza,
-    abbattendo del 60% il consumo di RAM e i tempi.
-    """
     combined_html = ""
     
     with sync_playwright() as p:
@@ -64,7 +80,6 @@ def check_ecommerce_optimized(base_url):
             )
             page = context.new_page()
             
-            # 1. Scansione Homepage
             try:
                 page.goto(base_url, timeout=15000)
                 page.wait_for_timeout(2000)
@@ -72,12 +87,10 @@ def check_ecommerce_optimized(base_url):
                 combined_html += homepage_html
             except Exception as e:
                 print(f"Errore homepage {base_url}: {str(e)}")
-                return False # Se non carica la home, inutile sforzare il server
+                return False, "Errore Navigazione" 
                 
-            # 2. Estrazione link prodotti dalla home
             product_links = extract_products(homepage_html, base_url)
             
-            # 3. Scansione Prodotti (sulla stessa tab)
             for p_url in product_links:
                 try:
                     page.goto(p_url, timeout=15000)
@@ -87,36 +100,40 @@ def check_ecommerce_optimized(base_url):
                     print(f"Errore prodotto {p_url}: {str(e)}")
                     
         finally:
-            browser.close() # Chiusura unica finale
+            browser.close()
             
-    return detect(combined_html)
+    # Ora restituiamo DUE dati
+    widget_presente = detect(combined_html)
+    piattaforma = detect_platform(combined_html)
+    
+    return widget_presente, piattaforma
 
-# --- LA SPIA LUMINOSA (Verifica se il server è online dal browser) ---
 @app.route('/', methods=['GET'])
 def home():
     return "✅ Il server Python è VIVO e funzionante! Il motore Anti-Bot è pronto."
 
-# --- API PER n8n ---
 @app.route('/api/check', methods=['POST'])
 @app.route('/api/check/', methods=['POST'])
 def api_single_check():
     data = request.get_json()
     if not data or 'url' not in data:
-        return jsonify({'widget_presente': False, 'error': 'URL mancante'}), 400
+        return jsonify({'widget_presente': False, 'piattaforma': 'Sconosciuta', 'error': 'URL mancante'}), 400
     
     url = data['url'].strip()
     if not url.startswith('http://') and not url.startswith('https://'):
         url = 'https://' + url
     
     try:
-        # Usa la nuova logica ottimizzata
-        result = check_ecommerce_optimized(url)
+        # Estraiamo i due valori dalla funzione
+        has_widget, platform = check_ecommerce_optimized(url)
         return jsonify({
-            'widget_presente': bool(result)
+            'widget_presente': has_widget,
+            'piattaforma': platform
         })
     except Exception as e:
         return jsonify({
             'widget_presente': False,
+            'piattaforma': 'Sconosciuta',
             'error': str(e)
         }), 500
 
