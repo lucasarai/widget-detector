@@ -94,9 +94,21 @@ def check_ecommerce_optimized(base_url):
     combined_html = ""
     error_log = ""
     
+    # --- LA CHIAVE PROXY ---
+    # Usiamo il parametro country_code=it per chiedere IP europei/italiani e sembrare più legittimi su Sephora.it
+    PROXY_USERNAME = "scraperapi.country_code=it"
+    PROXY_PASSWORD = "60730861602c4b7fb98ec93607035e7d"
+    PROXY_SERVER = "http://proxy-server.scraperapi.com:8001"
+    
     with sync_playwright() as p:
+        # Configurazione Proxy nativa iniettata nel browser
         browser = p.chromium.launch(
             headless=True,
+            proxy={
+                "server": PROXY_SERVER,
+                "username": PROXY_USERNAME,
+                "password": PROXY_PASSWORD
+            },
             args=[
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
@@ -110,16 +122,17 @@ def check_ecommerce_optimized(base_url):
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
-                locale="it-IT"
+                locale="it-IT",
+                ignore_https_errors=True # Necessario per evitare blocchi SSL dai Proxy
             )
             context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             page = context.new_page()
             
             try:
-                page.goto(base_url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000) 
+                # Timeout raddoppiato a 60 secondi perché i proxy residenziali sono più lenti
+                page.goto(base_url, timeout=60000, wait_until="domcontentloaded")
+                page.wait_for_timeout(4000) 
                 
-                # Spara al banner dei cookie
                 try:
                     page.evaluate("""
                         const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
@@ -129,7 +142,6 @@ def check_ecommerce_optimized(base_url):
                     page.wait_for_timeout(1000)
                 except: pass
                 
-                # Scroll verso il basso
                 try:
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
                     page.wait_for_timeout(2000)
@@ -139,7 +151,7 @@ def check_ecommerce_optimized(base_url):
                 homepage_html = page.content()
                 combined_html += homepage_html
                 
-                # ESTRAZIONE LINK NATIVA JS (Bypassa i limiti di Python/BeautifulSoup)
+                # Estrazione Link
                 raw_links = page.evaluate("""() => {
                     return Array.from(document.querySelectorAll('a')).map(a => a.href).filter(h => h);
                 }""")
@@ -157,29 +169,27 @@ def check_ecommerce_optimized(base_url):
                     if any(k in href_lower for k in keywords) or (href_lower.endswith('.html') and len(href) > 40):
                         valid_links.append(href)
                 
-                # Rimuovi duplicati e prendi i primi 2
                 product_links = list(set(valid_links))[:2]
                 
                 if not product_links:
-                    # IL SONAR: Estraiamo le prime 150 lettere visibili a schermo per capire COSA stiamo guardando
                     try:
                         visible_text = page.evaluate("document.body.innerText.substring(0, 150)")
                         visible_text = visible_text.replace('\n', ' ').strip()
                     except:
                         visible_text = "Impossibile leggere il testo"
                         
-                    error_log += f" [WALL DETECTED: Titolo='{page_title}' | Testo Visibile='{visible_text}'] "
+                    error_log += f" [Nessun Prodotto Trovato: Titolo='{page_title}' | Testo='{visible_text}'] "
                     
             except Exception as e:
-                error_log = f"Errore navigazione base: {str(e)}"
+                error_log = f"Errore navigazione base (Proxy Timeout?): {str(e)}"
                 return False, "Sconosciuta", error_log
                 
             for p_url in product_links:
                 try:
-                    page.goto(p_url, timeout=30000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000) 
+                    page.goto(p_url, timeout=60000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(4000) 
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(3000)
                     combined_html += page.content()
                 except Exception as e:
                     error_log += f" | Timeout su prodotto ({p_url})"
@@ -196,7 +206,7 @@ def check_ecommerce_optimized(base_url):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "✅ Server VIVO."
+    return "✅ Server VIVO e PROXY ATTIVATO."
 
 @app.route('/api/check', methods=['POST'])
 @app.route('/api/check/', methods=['POST'])
