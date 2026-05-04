@@ -1,5 +1,5 @@
 # 1. Usa l'immagine UFFICIALE di Microsoft Playwright
-FROM mcr.microsoft.com/playwright/python:v1.42.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.59.0-jammy
 
 # 2. Crea la cartella di lavoro
 WORKDIR /app
