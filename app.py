@@ -17,10 +17,11 @@ PROVIDERS = [
 def extract_products(html, base_url):
     soup = BeautifulSoup(html, "html.parser")
     links = []
+    # Aggiunti pattern Enterprise: /p/ (Sephora), /item/
     for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
-        if "/products/" in href or "/prodotto/" in href:
-            links.append(urljoin(base_url, href))
+        href = a.get("href", "").lower()
+        if "/products/" in href or "/prodotto/" in href or "/p/" in href or "/item/" in href:
+            links.append(urljoin(base_url, a.get("href")))
     return list(set(links))[:2] 
 
 def detect_platform(html):
@@ -39,6 +40,9 @@ def detect_platform(html):
         return "PrestaShop"
     if "cdn11.bigcommerce.com" in html_lower:
         return "BigCommerce"
+    # Aggiunto rilevamento Salesforce Commerce Cloud (Demandware) usato da Sephora
+    if "demandware.store" in html_lower or "dw.acct" in html_lower or "salesforce" in html_lower:
+        return "Salesforce Commerce Cloud"
         
     return "Sconosciuta"
 
@@ -112,20 +116,18 @@ def check_ecommerce_optimized(base_url):
     error_log = ""
     
     with sync_playwright() as p:
-        # ARMI PESANTI CONTRO I BLOCCHI BOT
         browser = p.chromium.launch(
             headless=True,
             args=[
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
                 '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled', # Nasconde Playwright
+                '--disable-blink-features=AutomationControlled', 
                 '--disable-web-security',
                 '--disable-features=IsolateOrigins,site-per-process'
             ]
         )
         try:
-            # Creiamo un contesto che simula perfettamente un utente Chrome su Mac
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
@@ -136,15 +138,13 @@ def check_ecommerce_optimized(base_url):
                 timezone_id="Europe/Rome"
             )
             
-            # Impedisce che il sito capisca che è un bot
             context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
             page = context.new_page()
             
             try:
-                # Timeout alzato a 30 secondi (30000 ms) e usiamo "domcontentloaded" per essere più veloci
                 page.goto(base_url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000) # Aspetta 3 secondi per far caricare i widget asincroni
+                page.wait_for_timeout(2000)
                 homepage_html = page.content()
                 combined_html += homepage_html
             except Exception as e:
@@ -156,10 +156,24 @@ def check_ecommerce_optimized(base_url):
             for p_url in product_links:
                 try:
                     page.goto(p_url, timeout=30000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000)
+                    page.wait_for_timeout(2000)
+                    
+                    # NOVITÀ: Tenta di cliccare un bottone "Accetta" (Cookie) per sbloccare la pagina
+                    try:
+                        page.evaluate("""
+                            const buttons = Array.from(document.querySelectorAll('button, a'));
+                            const acceptBtn = buttons.find(b => b.innerText.match(/accetta|accept|agree|consenti/i));
+                            if(acceptBtn) acceptBtn.click();
+                        """)
+                    except:
+                        pass # Se non trova il bottone, vai avanti tranquillo
+                    
+                    # NOVITÀ: Scroll della pagina verso il basso per attivare i widget "lazy loaded" (come quelli di Sephora/Bazaarvoice)
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
+                    page.wait_for_timeout(2000)
+                    
                     combined_html += page.content()
                 except Exception as e:
-                    # Registriamo l'errore ma non blocchiamo l'esecuzione, magari l'altro prodotto funziona
                     error_log += f" | Errore Prodotto ({p_url}): {str(e)}"
                     
         except Exception as global_e:
@@ -194,7 +208,6 @@ def api_single_check():
             'widget_presente': has_widget,
             'piattaforma': platform
         }
-        # Se c'è un errore interno (timeout, bot block), lo mostriamo nel JSON
         if log:
             response_data['internal_log'] = log
             
