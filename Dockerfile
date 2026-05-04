@@ -1,21 +1,15 @@
-# 1. Usa un ambiente Python puro e leggero
-FROM python:3.10-slim
+# 1. Usa l'immagine UFFICIALE di Microsoft Playwright (ha già Chromium e Ubuntu pre-configurati!)
+FROM mcr.microsoft.com/playwright/python:v1.42.0-jammy
 
 # 2. Crea la cartella di lavoro
 WORKDIR /app
 
-# 3. Copia il file dei requisiti e installa le librerie Python
+# 3. Copia i requisiti e installa solo Flask, BS4 e Gunicorn
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 4. Installa il browser Chromium
-RUN playwright install chromium
-
-# 5. IL TRUCCO MAGICO: Installa tutte le dipendenze di sistema (librerie grafiche Linux) in automatico
-RUN playwright install-deps
-
-# 6. Copia tutto il tuo codice (app.py) nel server
+# 4. Copia il tuo codice geniale
 COPY . .
 
-# 7. Avvia il server con Gunicorn
+# 5. Avvia il server
 CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:8000", "--timeout", "120", "--workers", "2"]
