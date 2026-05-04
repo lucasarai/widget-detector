@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 import json
 import re
 import traceback
@@ -93,67 +93,43 @@ def detect(html):
 def check_ecommerce_optimized(base_url):
     combined_html = ""
     error_log = ""
-    
-    # --- LA CHIAVE PROXY ---
-    # Usiamo il parametro country_code=it per chiedere IP europei/italiani e sembrare più legittimi su Sephora.it
-    PROXY_USERNAME = "scraperapi.country_code=it"
-    PROXY_PASSWORD = "60730861602c4b7fb98ec93607035e7d"
-    PROXY_SERVER = "http://proxy-server.scraperapi.com:8001"
+    API_KEY = "60730861602c4b7fb98ec93607035e7d"
     
     with sync_playwright() as p:
-        # Configurazione Proxy nativa iniettata nel browser
+        # RIMOSSO IL PROXY DI RETE CHE CAUSAVA IL BLOCCO IP. Bypassiamo via URL.
         browser = p.chromium.launch(
             headless=True,
-            proxy={
-                "server": PROXY_SERVER,
-                "username": PROXY_USERNAME,
-                "password": PROXY_PASSWORD
-            },
             args=[
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
                 '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled', 
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process'
+                '--disable-blink-features=AutomationControlled'
             ]
         )
         try:
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
-                locale="it-IT",
-                ignore_https_errors=True # Necessario per evitare blocchi SSL dai Proxy
+                locale="it-IT"
             )
-            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             page = context.new_page()
             
             try:
-                # Timeout raddoppiato a 60 secondi perché i proxy residenziali sono più lenti
-                page.goto(base_url, timeout=60000, wait_until="domcontentloaded")
-                page.wait_for_timeout(4000) 
+                # CREAZIONE DELL'URL BYPASS
+                encoded_base_url = quote(base_url)
+                # Chiediamo a ScraperAPI di fare il lavoro sporco con render=true
+                bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={encoded_base_url}&render=true&country_code=it"
                 
-                try:
-                    page.evaluate("""
-                        const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
-                        const acceptBtn = buttons.find(b => b.innerText.match(/accetta|accept|agree|consenti/i));
-                        if(acceptBtn) acceptBtn.click();
-                    """)
-                    page.wait_for_timeout(1000)
-                except: pass
-                
-                try:
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
-                    page.wait_for_timeout(2000)
-                except: pass
+                page.goto(bypass_url, timeout=60000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000) 
                 
                 page_title = page.title()
                 homepage_html = page.content()
                 combined_html += homepage_html
                 
-                # Estrazione Link
+                # ESTRAZIONE LINK A PROVA DI BOMBA (Prendiamo il parametro href grezzo)
                 raw_links = page.evaluate("""() => {
-                    return Array.from(document.querySelectorAll('a')).map(a => a.href).filter(h => h);
+                    return Array.from(document.querySelectorAll('a')).map(a => a.getAttribute('href')).filter(h => h);
                 }""")
                 
                 keywords = ['/product/', '/products/', '/prodotto/', '/prodotti/', '/p/', '/item/', '/sku/', '-p-']
@@ -162,12 +138,12 @@ def check_ecommerce_optimized(base_url):
                 valid_links = []
                 for href in raw_links:
                     href_lower = href.lower()
-                    if not href.startswith('http'): continue
                     if any(ex in href_lower for ex in exclude): continue
-                    if base_url.rstrip('/') == href.rstrip('/'): continue
+                    if href_lower == base_url.lower() or href_lower == '/': continue
                     
-                    if any(k in href_lower for k in keywords) or (href_lower.endswith('.html') and len(href) > 40):
-                        valid_links.append(href)
+                    if any(k in href_lower for k in keywords) or (href_lower.endswith('.html') and len(href) > 20):
+                        # Ricostruiamo l'URL originale di Sephora, unendo la base corretta all'href
+                        valid_links.append(urljoin(base_url, href))
                 
                 product_links = list(set(valid_links))[:2]
                 
@@ -181,15 +157,16 @@ def check_ecommerce_optimized(base_url):
                     error_log += f" [Nessun Prodotto Trovato: Titolo='{page_title}' | Testo='{visible_text}'] "
                     
             except Exception as e:
-                error_log = f"Errore navigazione base (Proxy Timeout?): {str(e)}"
+                error_log = f"Errore navigazione Bypass API: {str(e)}"
                 return False, "Sconosciuta", error_log
                 
             for p_url in product_links:
                 try:
-                    page.goto(p_url, timeout=60000, wait_until="domcontentloaded")
+                    encoded_p_url = quote(p_url)
+                    p_bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={encoded_p_url}&render=true&country_code=it"
+                    
+                    page.goto(p_bypass_url, timeout=60000, wait_until="domcontentloaded")
                     page.wait_for_timeout(4000) 
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
-                    page.wait_for_timeout(3000)
                     combined_html += page.content()
                 except Exception as e:
                     error_log += f" | Timeout su prodotto ({p_url})"
@@ -206,7 +183,7 @@ def check_ecommerce_optimized(base_url):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "✅ Server VIVO e PROXY ATTIVATO."
+    return "✅ Server VIVO e API BYPASS ATTIVATO."
 
 @app.route('/api/check', methods=['POST'])
 @app.route('/api/check/', methods=['POST'])
