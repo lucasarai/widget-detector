@@ -3,12 +3,14 @@ from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import json
+import re
 
 app = Flask(__name__)
 
 PROVIDERS = [
     "trustpilot.com", "yotpo.com", "reviews.io", 
-    "stamped.io", "okendo.io", "bazaarvoice.com", "judge.me"
+    "stamped.io", "okendo.io", "bazaarvoice.com", "judge.me",
+    "powerreviews.com", "reevoo.com", "feefo.com"
 ]
 
 def extract_products(html, base_url):
@@ -20,32 +22,6 @@ def extract_products(html, base_url):
             links.append(urljoin(base_url, href))
     return list(set(links))[:2] 
 
-def detect(html):
-    if not html:
-        return False
-        
-    soup = BeautifulSoup(html, "html.parser")
-    
-    for tag in soup.find_all(["script", "iframe"], src=True):
-        src = tag.get("src", "").lower()
-        if any(p in src for p in PROVIDERS):
-            return True
-    
-    html_lower = html.lower()
-    if "shopify-product-reviews" in html_lower or "spr-container" in html_lower:
-        return True
-    
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string)
-            if "rating" in json.dumps(data).lower():
-                return True
-        except:
-            pass
-    
-    return False
-
-# --- NUOVA FUNZIONE: PLATFORM DETECTION ---
 def detect_platform(html):
     if not html:
         return "Sconosciuta"
@@ -65,6 +41,80 @@ def detect_platform(html):
         return "BigCommerce"
         
     return "Sconosciuta"
+
+def detect(html):
+    """
+    Motore di detection universale per widget recensioni.
+    Implementa Scraping Semantico, Microdati (JSON-LD) ed Euristiche Regex.
+    """
+    if not html:
+        return False
+
+    soup = BeautifulSoup(html, "html.parser")
+    html_lower = html.lower()
+
+    # --- LIVELLO 1: PROVIDER NOTI (Il controllo veloce) ---
+    if any(provider in html_lower for provider in PROVIDERS):
+        return True
+    
+    if "shopify-product-reviews" in html_lower or "spr-container" in html_lower:
+        return True
+
+    # --- LIVELLO 2: MICRODATI STRUTTURATI (Schema.org) ---
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            json_str = script.string.strip() if script.string else ""
+            if not json_str:
+                continue
+                
+            data = json.loads(json_str)
+            
+            items = data if isinstance(data, list) else [data]
+                
+            for item in items:
+                item_str = json.dumps(item).lower()
+                if '"@type": "aggregaterating"' in item_str or '"@type": "review"' in item_str:
+                    return True
+                if '"@type": "product"' in item_str and ('"aggregaterating"' in item_str or '"review"' in item_str):
+                    return True
+        except Exception:
+            pass 
+
+    if soup.find(attrs={"itemprop": re.compile(r"aggregateRating|review", re.I)}):
+        return True
+    if soup.find(attrs={"itemtype": re.compile(r"AggregateRating|Review", re.I)}):
+        return True
+
+    # --- LIVELLO 3: SCRAPING SEMANTICO (Classi CSS e ID) ---
+    review_classes = re.compile(
+        r"(bv-rating|yotpo-bottomline|jdgm-widget|spr-badge|stamped-summary|pr-snippet|trustpilot-widget|review-stars|star-rating|product-reviews|rating-summary)", 
+        re.I
+    )
+    
+    for tag in soup.find_all(['div', 'span', 'section']):
+        classes = tag.get('class', [])
+        if not isinstance(classes, list):
+            classes = [classes]
+            
+        class_string = " ".join(classes).lower()
+        id_string = tag.get('id', '').lower()
+        
+        if review_classes.search(class_string) or review_classes.search(id_string):
+            return True
+
+    # --- LIVELLO 4: PARSING TESTUALE INTELLIGENTE (Regex Euristiche) ---
+    for script_or_style in soup(['script', 'style']):
+        script_or_style.decompose()
+        
+    visible_text = soup.get_text(separator=' ', strip=True).lower()
+
+    if re.search(r"\(?\b\d+\b\)?\s*(recensioni|recensione|reviews|review)\b", visible_text):
+         return True
+         
+    if re.search(r"\b[0-5][.,][0-9]\s*(/|su)\s*5\b", visible_text):
+         return True
+
+    return False
 
 def check_ecommerce_optimized(base_url):
     combined_html = ""
@@ -102,16 +152,17 @@ def check_ecommerce_optimized(base_url):
         finally:
             browser.close()
             
-    # Ora restituiamo DUE dati
     widget_presente = detect(combined_html)
     piattaforma = detect_platform(combined_html)
     
     return widget_presente, piattaforma
 
+# --- LA SPIA LUMINOSA (Verifica se il server è online dal browser) ---
 @app.route('/', methods=['GET'])
 def home():
     return "✅ Il server Python è VIVO e funzionante! Il motore Anti-Bot è pronto."
 
+# --- API PER n8n ---
 @app.route('/api/check', methods=['POST'])
 @app.route('/api/check/', methods=['POST'])
 def api_single_check():
@@ -124,7 +175,6 @@ def api_single_check():
         url = 'https://' + url
     
     try:
-        # Estraiamo i due valori dalla funzione
         has_widget, platform = check_ecommerce_optimized(url)
         return jsonify({
             'widget_presente': has_widget,
