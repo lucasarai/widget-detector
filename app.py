@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import json
 import re
+import traceback
 
 app = Flask(__name__)
 
@@ -28,7 +29,6 @@ def detect_platform(html):
         
     html_lower = html.lower()
     
-    # Rilevamento tramite impronte digitali note (CDN, script, classi)
     if "cdn.shopify.com" in html_lower or "window.shopify" in html_lower or "shopify.theme" in html_lower:
         return "Shopify"
     if "wp-content/plugins/woocommerce" in html_lower or "woocommerce-cart" in html_lower or "var woocommerce_params" in html_lower:
@@ -43,24 +43,18 @@ def detect_platform(html):
     return "Sconosciuta"
 
 def detect(html):
-    """
-    Motore di detection universale per widget recensioni.
-    Implementa Scraping Semantico, Microdati (JSON-LD) ed Euristiche Regex.
-    """
     if not html:
         return False
 
     soup = BeautifulSoup(html, "html.parser")
     html_lower = html.lower()
 
-    # --- LIVELLO 1: PROVIDER NOTI (Il controllo veloce) ---
     if any(provider in html_lower for provider in PROVIDERS):
         return True
     
     if "shopify-product-reviews" in html_lower or "spr-container" in html_lower:
         return True
 
-    # --- LIVELLO 2: MICRODATI STRUTTURATI (Schema.org) ---
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             json_str = script.string.strip() if script.string else ""
@@ -68,7 +62,6 @@ def detect(html):
                 continue
                 
             data = json.loads(json_str)
-            
             items = data if isinstance(data, list) else [data]
                 
             for item in items:
@@ -85,7 +78,6 @@ def detect(html):
     if soup.find(attrs={"itemtype": re.compile(r"AggregateRating|Review", re.I)}):
         return True
 
-    # --- LIVELLO 3: SCRAPING SEMANTICO (Classi CSS e ID) ---
     review_classes = re.compile(
         r"(bv-rating|yotpo-bottomline|jdgm-widget|spr-badge|stamped-summary|pr-snippet|trustpilot-widget|review-stars|star-rating|product-reviews|rating-summary)", 
         re.I
@@ -102,7 +94,6 @@ def detect(html):
         if review_classes.search(class_string) or review_classes.search(id_string):
             return True
 
-    # --- LIVELLO 4: PARSING TESTUALE INTELLIGENTE (Regex Euristiche) ---
     for script_or_style in soup(['script', 'style']):
         script_or_style.decompose()
         
@@ -118,51 +109,74 @@ def detect(html):
 
 def check_ecommerce_optimized(base_url):
     combined_html = ""
+    error_log = ""
     
     with sync_playwright() as p:
+        # ARMI PESANTI CONTRO I BLOCCHI BOT
         browser = p.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            args=[
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled', # Nasconde Playwright
+                '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process'
+            ]
         )
         try:
+            # Creiamo un contesto che simula perfettamente un utente Chrome su Mac
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
+                device_scale_factor=1,
+                has_touch=False,
+                is_mobile=False,
+                locale="it-IT",
+                timezone_id="Europe/Rome"
             )
+            
+            # Impedisce che il sito capisca che è un bot
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            
             page = context.new_page()
             
             try:
-                page.goto(base_url, timeout=15000)
-                page.wait_for_timeout(2000)
+                # Timeout alzato a 30 secondi (30000 ms) e usiamo "domcontentloaded" per essere più veloci
+                page.goto(base_url, timeout=30000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000) # Aspetta 3 secondi per far caricare i widget asincroni
                 homepage_html = page.content()
                 combined_html += homepage_html
             except Exception as e:
-                print(f"Errore homepage {base_url}: {str(e)}")
-                return False, "Errore Navigazione" 
+                error_log = f"Errore Homepage ({base_url}): {str(e)}"
+                return False, "Sconosciuta", error_log
                 
             product_links = extract_products(homepage_html, base_url)
             
             for p_url in product_links:
                 try:
-                    page.goto(p_url, timeout=15000)
-                    page.wait_for_timeout(2000) 
+                    page.goto(p_url, timeout=30000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(3000)
                     combined_html += page.content()
                 except Exception as e:
-                    print(f"Errore prodotto {p_url}: {str(e)}")
+                    # Registriamo l'errore ma non blocchiamo l'esecuzione, magari l'altro prodotto funziona
+                    error_log += f" | Errore Prodotto ({p_url}): {str(e)}"
                     
+        except Exception as global_e:
+             error_log = f"Errore Fatale Browser: {str(global_e)}"
+             return False, "Sconosciuta", error_log
         finally:
             browser.close()
             
     widget_presente = detect(combined_html)
     piattaforma = detect_platform(combined_html)
     
-    return widget_presente, piattaforma
+    return widget_presente, piattaforma, error_log
 
-# --- LA SPIA LUMINOSA (Verifica se il server è online dal browser) ---
 @app.route('/', methods=['GET'])
 def home():
     return "✅ Il server Python è VIVO e funzionante! Il motore Anti-Bot è pronto."
 
-# --- API PER n8n ---
 @app.route('/api/check', methods=['POST'])
 @app.route('/api/check/', methods=['POST'])
 def api_single_check():
@@ -175,16 +189,22 @@ def api_single_check():
         url = 'https://' + url
     
     try:
-        has_widget, platform = check_ecommerce_optimized(url)
-        return jsonify({
+        has_widget, platform, log = check_ecommerce_optimized(url)
+        response_data = {
             'widget_presente': has_widget,
             'piattaforma': platform
-        })
+        }
+        # Se c'è un errore interno (timeout, bot block), lo mostriamo nel JSON
+        if log:
+            response_data['internal_log'] = log
+            
+        return jsonify(response_data)
     except Exception as e:
         return jsonify({
             'widget_presente': False,
             'piattaforma': 'Sconosciuta',
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc()
         }), 500
 
 if __name__ == '__main__':
