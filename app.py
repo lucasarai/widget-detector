@@ -30,10 +30,17 @@ def detect(html):
     soup = BeautifulSoup(html, "html.parser")
     html_lower = html.lower()
 
+    # Ricerca bruta per domini dei provider
     if any(provider in html_lower for provider in PROVIDERS): return True
+    
+    # Firme specifiche (anche se Lazy Loaded, i link JS spesso ci sono)
+    if "bazaarvoice.com/deployments" in html_lower or "bv.js" in html_lower or "bazaarvoice" in html_lower: return True
+    if "widget.trustpilot.com" in html_lower or "trustpilot-widget" in html_lower: return True
+    if "cdn-stamped-io" in html_lower or "stamped-summary" in html_lower: return True
+    if "yotpo.com/js" in html_lower or "yotpo-bottomline" in html_lower: return True
     if "shopify-product-reviews" in html_lower or "spr-container" in html_lower: return True
-    if "data-bv-show" in html_lower or "bazaarvoice" in html_lower: return True # Regola specifica per Sephora/Bazaarvoice
 
+    # Parsing JSON-LD generico
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             json_str = script.string.strip() if script.string else ""
@@ -46,37 +53,46 @@ def detect(html):
         except Exception:
             pass 
 
+    # Attributi Schema.org
     if soup.find(attrs={"itemprop": re.compile(r"aggregateRating|review", re.I)}): return True
-    review_classes = re.compile(r"(bv-rating|yotpo-bottomline|jdgm-widget|spr-badge|stamped-summary|trustpilot-widget)", re.I)
     
+    # Classi CSS classiche
+    review_classes = re.compile(r"(bv-rating|yotpo-bottomline|jdgm-widget|spr-badge|stamped-summary|trustpilot-widget|rating-summary)", re.I)
     for tag in soup.find_all(['div', 'span', 'section']):
         classes = " ".join(tag.get('class', [])).lower() if isinstance(tag.get('class'), list) else tag.get('class', '')
         if review_classes.search(str(classes)) or review_classes.search(str(tag.get('id', ''))): return True
-
-    visible_text = soup.get_text(separator=' ', strip=True).lower()
-    if re.search(r"\b[0-5][.,][0-9]\s*(/|su)\s*5\b", visible_text): return True
 
     return False
 
 def extract_trustpilot_data(page, base_url, api_key):
     try:
-        # Pulisce URL (es: https://www.sephora.it -> sephora.it)
         domain = urlparse(base_url).netloc.replace('www.', '')
         if not domain: return "N/A", "0"
         
         tp_url = f"https://it.trustpilot.com/review/{domain}"
-        bypass_tp = f"http://api.scraperapi.com/?api_key={api_key}&url={quote(tp_url)}&premium=true&country_code=it"
+        # Rimosso 'render=true' di proposito. Vogliamo HTML grezzo con i dati Next.js nascosti.
+        bypass_tp = f"http://api.scraperapi.com/?api_key={api_key}&url={quote(tp_url)}&country_code=it"
         
-        page.goto(bypass_tp, timeout=60000, wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
-        
+        page.goto(bypass_tp, timeout=45000, wait_until="domcontentloaded")
         tp_html = page.content()
         soup = BeautifulSoup(tp_html, "html.parser")
         
         score = "N/A"
         reviews_count = "0"
         
-        # 1. Parsing JSON-LD (Primario)
+        # 1. Hack Definitivo: Database Next.js (Infallibile se l'azienda esiste)
+        next_data = soup.find("script", id="__NEXT_DATA__")
+        if next_data:
+            try:
+                data = json.loads(next_data.string)
+                business_unit = data.get('props', {}).get('pageProps', {}).get('businessUnit', {})
+                if business_unit:
+                    score = str(business_unit.get('trustScore', "N/A"))
+                    reviews_count = str(business_unit.get('numberOfReviews', "0"))
+                    if score != "N/A": return score, reviews_count
+            except: pass
+        
+        # 2. Fallback: JSON-LD Standard
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 json_text = script.string if script.string else ""
@@ -89,16 +105,6 @@ def extract_trustpilot_data(page, base_url, api_key):
                         return score, reviews_count
             except: pass
                 
-        # 2. Parsing HTML Visivo (Fallback se JSON-LD cambia)
-        score_tag = soup.find(attrs={"data-rating-typography": "true"})
-        if score_tag: score = score_tag.text.strip().replace(',', '.')
-        
-        reviews_tag = soup.find(attrs={"data-reviews-count-typography": "true"})
-        if reviews_tag: 
-            # Estrae solo i numeri dalla stringa (es. "633 recensioni" -> "633")
-            reviews_count = re.sub(r'[^\d]', '', reviews_tag.text.strip())
-            if not reviews_count: reviews_count = "0"
-        
         return score, reviews_count
     except Exception as e:
         return "N/A", "0"
@@ -106,11 +112,8 @@ def extract_trustpilot_data(page, base_url, api_key):
 def check_ecommerce_optimized(base_url):
     combined_html = ""
     error_log = ""
-    API_KEY = "60730861602c4b7fb98ec93607035e7d"
+    API_KEY = "60730861602c4b7fb98ec93607035e7d" # Manteniamo la chiave qui per i test attuali
     
-    if not API_KEY:
-        return False, "Sconosciuta", "N/A", "0", "ERRORE: API_KEY mancante in Railway"
-        
     if not base_url.startswith('http'): base_url = 'https://' + base_url
 
     with sync_playwright() as p:
@@ -126,42 +129,33 @@ def check_ecommerce_optimized(base_url):
             try:
                 bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={quote(base_url)}&render=true&premium=true&country_code=it"
                 page.goto(bypass_url, timeout=90000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000) 
-                
                 homepage_html = page.content()
                 combined_html += homepage_html
                 
-                raw_links = page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => a.getAttribute('href')).filter(h => h)")
+                # Usa BeautifulSoup per estrarre i link, è più affidabile su ScraperAPI
+                soup_home = BeautifulSoup(homepage_html, "html.parser")
+                raw_links = [a.get('href') for a in soup_home.find_all('a', href=True)]
+                
                 keywords = ['/product/', '/products/', '/prodotto/', '/p/', '.html']
-                valid_links = [urljoin(base_url, h) for h in raw_links if any(k in h.lower() for k in keywords) and h != '/' and not h.startswith('#')][:2]
+                valid_links = []
+                for href in raw_links:
+                    h_lower = href.lower()
+                    if any(k in h_lower for k in keywords) and not href.startswith('#'):
+                        full_link = urljoin(base_url, href)
+                        if full_link != base_url and full_link not in valid_links:
+                            valid_links.append(full_link)
+                
+                valid_links = valid_links[:2] # Prende i primi due prodotti reali
                 
             except Exception as e:
                 error_log += f"[Errore Homepage: {str(e)}] "
                 valid_links = []
                 
-            # --- 2. PAGINE PRODOTTO (Con Scroll Umano Profondo) ---
+            # --- 2. PAGINE PRODOTTO ---
             for p_url in valid_links:
                 try:
                     p_bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={quote(p_url)}&render=true&premium=true&country_code=it"
                     page.goto(p_bypass_url, timeout=90000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000) 
-                    
-                    # Scroll Umano Dinamico (Risveglia Bazaarvoice)
-                    page.evaluate("""
-                        () => new Promise((resolve) => {
-                            let totalHeight = 0;
-                            let distance = 600;
-                            let timer = setInterval(() => {
-                                window.scrollBy(0, distance);
-                                totalHeight += distance;
-                                if(totalHeight >= document.body.scrollHeight || totalHeight > 8000){
-                                    clearInterval(timer);
-                                    resolve();
-                                }
-                            }, 400);
-                        })
-                    """)
-                    page.wait_for_timeout(2000)
                     combined_html += page.content()
                 except Exception as e:
                     error_log += f"[Timeout Prodotto: {p_url}] "
@@ -181,7 +175,7 @@ def check_ecommerce_optimized(base_url):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "✅ Server VIVO - Motore TP e Anti-LazyLoad ATTIVATO."
+    return "✅ Server VIVO - Motore JSON-LD e TP __NEXT_DATA__ ATTIVATO."
 
 @app.route('/api/check', methods=['POST'])
 @app.route('/api/check/', methods=['POST'])
@@ -210,4 +204,3 @@ def api_single_check():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(debug=False, host='0.0.0.0', port=port)
-    # fix riavvio variabili
