@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
+from playwright_stealth import Stealth  # <--- NUOVO IMPORT V2
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote, urlparse
 import urllib.request
@@ -20,13 +20,13 @@ def get_trustpilot_data(domain, api_key):
         # Pulizia dominio
         clean_domain = domain.replace('www.', '')
         search_url = f"https://it.trustpilot.com/search?query={clean_domain}"
+        
         # Chiamata proxy diretta (senza browser per velocità)
         proxy_url = f"http://api.scraperapi.com/?api_key={api_key}&url={quote(search_url)}&country_code=it"
         
         req = urllib.request.Request(proxy_url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=30) as response:
             # Trustpilot spesso fa un redirect 302 se trova l'azienda esatta
-            final_url = response.geturl()
             html = response.read().decode('utf-8')
             
         soup = BeautifulSoup(html, "html.parser")
@@ -59,11 +59,16 @@ def check_site_advanced(target_url):
     page_title = "N/A"
     logs = []
 
-    with sync_playwright() as p:
-        # Lanciamo il browser con ScraperAPI come PROXY
-        browser = p.chromium.launch(headless=True)
+    # APPLICHIAMO LO STEALTH GLOBALE DIRETTAMENTE SULL'API DI PLAYWRIGHT
+    with Stealth().use_sync(sync_playwright()) as p:
         
-        # Creiamo un contesto con Stealth e Proxy
+        # Lanciamo il browser con argomenti di sicurezza
+        browser = p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
+        
+        # Creiamo un contesto che passa attraverso il Proxy di ScraperAPI
         context = browser.new_context(
             proxy={"server": PROXY_SERVER},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -72,13 +77,13 @@ def check_site_advanced(target_url):
         )
         
         page = context.new_page()
-        stealth_sync(page) # Applica le tecniche di evasione anti-bot
 
-        # --- NETWORK INTERCEPTION ---
+        # --- NETWORK INTERCEPTION (Lo sniffer di Rete) ---
         def intercept_network(response):
             url = response.url.lower()
-            # Identificazione Piattaforme via Headers/URL
             nonlocal detected_platform
+            
+            # Identificazione Piattaforme via Headers/URL
             if "shopify" in url or "x-shopify-stage" in response.headers:
                 detected_platform = "Shopify"
             elif "dwac_" in url or "dwsid" in url:
@@ -94,6 +99,7 @@ def check_site_advanced(target_url):
             elif "judgeme" in url:
                 detected_providers.add("Judge.me")
 
+        # Accendiamo l'orecchio assoluto prima di fare qualsiasi navigazione
         page.on("response", intercept_network)
 
         try:
@@ -101,7 +107,7 @@ def check_site_advanced(target_url):
             page.goto(target_url, wait_until="networkidle", timeout=60000)
             page_title = page.title()
             
-            # Controllo Piattaforma via Cookie (SFCC Detection)
+            # Controllo Piattaforma via Cookie (SFCC Detection infallibile)
             cookies = context.cookies()
             if any("dwac_" in c['name'] or "dwsid" in c['name'] for c in cookies):
                 detected_platform = "Salesforce Commerce Cloud"
@@ -110,23 +116,22 @@ def check_site_advanced(target_url):
             html = page.content()
             soup = BeautifulSoup(html, "html.parser")
             links = [urljoin(target_url, a.get('href')) for a in soup.find_all('a', href=True)]
-            product_links = [l for l in links if any(k in l.lower() for k in ['/p/', '/prodotto/', '/product/'])][:1]
+            product_links = [l for l in links if any(k in l.lower() for k in ['/p/', '/prodotto/', '/product/', '-p-'])][:1]
 
             if product_links:
-                # Navigazione Prodotto + Comportamento Umano
+                # Navigazione Prodotto + Comportamento Umano per triggerare Lazy Loading
                 page.goto(product_links[0], wait_until="networkidle", timeout=60000)
-                # Scroll per triggerare i widget pigri (Lazy Loading)
                 page.mouse.wheel(0, 2000)
                 page.wait_for_timeout(3000)
                 page.mouse.wheel(0, 4000)
                 page.wait_for_timeout(2000)
 
         except Exception as e:
-            logs.append(f"Errore: {str(e)}")
+            logs.append(f"Errore Navigazione: {str(e)}")
         finally:
             browser.close()
 
-    # Logica finale
+    # Logica finale di assemblaggio dati
     has_widget = len(detected_providers) > 0
     domain = urlparse(target_url).netloc
     tp_score, tp_reviews = get_trustpilot_data(domain, SCRAPER_API_KEY)
@@ -142,8 +147,12 @@ def check_site_advanced(target_url):
     }
 
 @app.route('/api/check', methods=['POST'])
+@app.route('/api/check/', methods=['POST'])
 def api_check():
     data = request.get_json()
+    if not data or 'url' not in data:
+        return jsonify({'error': 'URL mancante'}), 400
+        
     url = data.get('url', '').strip()
     if not url.startswith('http'): url = 'https://' + url
     
@@ -152,6 +161,10 @@ def api_check():
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/', methods=['GET'])
+def home():
+    return "✅ Server VIVO - Evasive Network Analyzer (V2 Stealth) ATTIVATO."
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
