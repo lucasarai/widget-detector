@@ -18,7 +18,7 @@ PROVIDERS = [
 def detect_platform(html):
     if not html: return "Sconosciuta"
     html_lower = html.lower()
-    if "cdn.shopify.com" in html_lower or "window.shopify" in html_lower or "shopify.theme" in html_lower: return "Shopify"
+    if "cdn.shopify.com" in html_lower or "window.shopify" in html_lower or "shopify.theme" in html_lower or "shopify" in html_lower: return "Shopify"
     if "woocommerce" in html_lower or "wp-content/plugins/woocommerce" in html_lower: return "WooCommerce"
     if "text/x-magento-init" in html_lower: return "Magento"
     if "prestashop" in html_lower: return "PrestaShop"
@@ -36,7 +36,7 @@ def detect(html):
     if "bazaarvoice.com/deployments" in html_lower or "bv.js" in html_lower or "bazaarvoice" in html_lower: return True
     if "widget.trustpilot.com" in html_lower or "trustpilot-widget" in html_lower: return True
     if "cdn-stamped-io" in html_lower or "stamped-summary" in html_lower: return True
-    if "yotpo.com/js" in html_lower or "yotpo-bottomline" in html_lower: return True
+    if "yotpo.com/js" in html_lower or "yotpo-bottomline" in html_lower or "yotpo" in html_lower: return True
     if "shopify-product-reviews" in html_lower or "spr-container" in html_lower: return True
 
     for script in soup.find_all("script", type="application/ld+json"):
@@ -60,15 +60,11 @@ def detect(html):
 
     return False
 
-def get_trustpilot_fast(base_url, api_key):
-    """Estrazione Trustpilot tramite Request nativa, bypassando Playwright"""
+def fetch_tp(domain, api_key):
+    """Funzione di base per interrogare Trustpilot"""
+    tp_url = f"https://it.trustpilot.com/review/{domain}"
+    bypass_url = f"http://api.scraperapi.com/?api_key={api_key}&url={quote(tp_url)}&country_code=it"
     try:
-        domain = urlparse(base_url).netloc.replace('www.', '')
-        if not domain: return "N/A", "0"
-        
-        tp_url = f"https://it.trustpilot.com/review/{domain}"
-        bypass_url = f"http://api.scraperapi.com/?api_key={api_key}&url={quote(tp_url)}&country_code=it"
-        
         req = urllib.request.Request(bypass_url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=30) as response:
             html = response.read().decode('utf-8')
@@ -76,7 +72,6 @@ def get_trustpilot_fast(base_url, api_key):
         soup = BeautifulSoup(html, "html.parser")
         score, reviews = "N/A", "0"
         
-        # Cerca nel DB segreto di Trustpilot
         next_data = soup.find("script", id="__NEXT_DATA__")
         if next_data:
             data = json.loads(next_data.string)
@@ -86,7 +81,6 @@ def get_trustpilot_fast(base_url, api_key):
                 reviews = str(business_unit.get('numberOfReviews', "0"))
                 if score != "N/A": return score, reviews
                 
-        # Fallback HTML Visivo
         score_tag = soup.find(attrs={"data-rating-typography": "true"})
         if score_tag: score = score_tag.text.strip().replace(',', '.')
         
@@ -99,15 +93,30 @@ def get_trustpilot_fast(base_url, api_key):
     except Exception as e:
         return "N/A", "0"
 
+def get_trustpilot_fast(base_url, api_key):
+    """Estrazione Trustpilot con trucco del fallback su .com"""
+    domain = urlparse(base_url).netloc.replace('www.', '')
+    if not domain: return "N/A", "0"
+    
+    # Primo tentativo (Es. gymshark.it)
+    score, reviews = fetch_tp(domain, api_key)
+    
+    # Se fallisce ed è un dominio .it, tenta col .com (Es. gymshark.com)
+    if score == "N/A" and domain.endswith('.it'):
+        domain_com = domain[:-3] + ".com"
+        score, reviews = fetch_tp(domain_com, api_key)
+        
+    return score, reviews
+
 def check_ecommerce_optimized(base_url):
     combined_html = ""
     error_log = ""
-    page_title = "Titolo Non Trovato"
+    page_title = "Titolo Vuoto"
     API_KEY = "60730861602c4b7fb98ec93607035e7d" 
     
     if not base_url.startswith('http'): base_url = 'https://' + base_url
 
-    # Eseguiamo Trustpilot PRIMA e in parallelo, fuori da Playwright
+    # Eseguiamo Trustpilot con il nuovo sistema intelligente
     tp_score, tp_reviews = get_trustpilot_fast(base_url, API_KEY)
 
     with sync_playwright() as p:
@@ -119,18 +128,20 @@ def check_ecommerce_optimized(base_url):
             context = browser.new_context(viewport={"width": 1920, "height": 1080}, locale="it-IT")
             page = context.new_page()
             
-            # --- HOMEPAGE ---
             try:
-                # Aggiunto device_type=desktop per ScraperAPI per sembrare più legittimi
                 bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={quote(base_url)}&render=true&premium=true&country_code=it&device_type=desktop"
                 page.goto(bypass_url, timeout=90000, wait_until="domcontentloaded")
                 page.wait_for_timeout(4000)
                 
-                page_title = page.title() # Salviamo il titolo per capire se c'è un blocco
                 homepage_html = page.content()
                 combined_html += homepage_html
                 
                 soup_home = BeautifulSoup(homepage_html, "html.parser")
+                
+                # Estrazione titolo post-render (infallibile per i siti React)
+                if soup_home.title and soup_home.title.string:
+                    page_title = soup_home.title.string.strip()
+                
                 raw_links = [a.get('href') for a in soup_home.find_all('a', href=True)]
                 
                 keywords = ['/product/', '/products/', '/prodotto/', '/p/', '.html']
@@ -142,13 +153,12 @@ def check_ecommerce_optimized(base_url):
                         if full_link != base_url and full_link not in valid_links:
                             valid_links.append(full_link)
                 
-                valid_links = valid_links[:1] # Solo 1 prodotto per risparmiare tempo e crediti
+                valid_links = valid_links[:1] 
                 
             except Exception as e:
                 error_log += f"[Errore Homepage: {str(e)}] "
                 valid_links = []
                 
-            # --- PRODOTTO ---
             for p_url in valid_links:
                 try:
                     p_bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={quote(p_url)}&render=true&premium=true&country_code=it&device_type=desktop"
@@ -170,7 +180,7 @@ def check_ecommerce_optimized(base_url):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "✅ Server VIVO - Diagnostica e Trustpilot Nativo ATTIVATI."
+    return "✅ Server VIVO - TP Fallback .com e Title Fix ATTIVATI."
 
 @app.route('/api/check', methods=['POST'])
 @app.route('/api/check/', methods=['POST'])
