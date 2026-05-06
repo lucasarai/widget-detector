@@ -2,3 +2,5 @@ Flask
 playwright
 beautifulsoup4
 gunicorn
+playwright-stealth
+beautifulsoup4
