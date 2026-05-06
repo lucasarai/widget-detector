@@ -1,9 +1,10 @@
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, urlparse
 import json
 import re
+import os
 import traceback
 
 app = Flask(__name__)
@@ -15,37 +16,23 @@ PROVIDERS = [
 ]
 
 def detect_platform(html):
-    if not html:
-        return "Sconosciuta"
-        
+    if not html: return "Sconosciuta"
     html_lower = html.lower()
-    if "cdn.shopify.com" in html_lower or "window.shopify" in html_lower or "shopify.theme" in html_lower:
-        return "Shopify"
-    if "wp-content/plugins/woocommerce" in html_lower or "woocommerce-cart" in html_lower or "var woocommerce_params" in html_lower:
-        return "WooCommerce"
-    if "text/x-magento-init" in html_lower or "mage.cookies" in html_lower or "skin/frontend/" in html_lower:
-        return "Magento"
-    if "var prestashop" in html_lower or 'content="prestashop"' in html_lower:
-        return "PrestaShop"
-    if "cdn11.bigcommerce.com" in html_lower:
-        return "BigCommerce"
-    if "demandware.store" in html_lower or "dw.acct" in html_lower or "salesforce" in html_lower:
-        return "Salesforce Commerce Cloud"
-        
+    if "cdn.shopify.com" in html_lower or "window.shopify" in html_lower or "shopify.theme" in html_lower: return "Shopify"
+    if "woocommerce" in html_lower or "wp-content/plugins/woocommerce" in html_lower: return "WooCommerce"
+    if "text/x-magento-init" in html_lower: return "Magento"
+    if "prestashop" in html_lower: return "PrestaShop"
+    if "cdn11.bigcommerce.com" in html_lower: return "BigCommerce"
+    if "demandware.store" in html_lower or "salesforce" in html_lower: return "Salesforce Commerce Cloud"
     return "Sconosciuta"
 
 def detect(html):
-    if not html:
-        return False
-
+    if not html: return False
     soup = BeautifulSoup(html, "html.parser")
     html_lower = html.lower()
 
-    if any(provider in html_lower for provider in PROVIDERS):
-        return True
-    
-    if "shopify-product-reviews" in html_lower or "spr-container" in html_lower:
-        return True
+    if any(provider in html_lower for provider in PROVIDERS): return True
+    if "shopify-product-reviews" in html_lower or "spr-container" in html_lower: return True
 
     for script in soup.find_all("script", type="application/ld+json"):
         try:
@@ -55,133 +42,122 @@ def detect(html):
             items = data if isinstance(data, list) else [data]
             for item in items:
                 item_str = json.dumps(item).lower()
-                if '"@type": "aggregaterating"' in item_str or '"@type": "review"' in item_str:
-                    return True
-                if '"@type": "product"' in item_str and ('"aggregaterating"' in item_str or '"review"' in item_str):
-                    return True
+                if '"@type": "aggregaterating"' in item_str or '"@type": "review"' in item_str: return True
         except Exception:
             pass 
 
-    if soup.find(attrs={"itemprop": re.compile(r"aggregateRating|review", re.I)}):
-        return True
-    if soup.find(attrs={"itemtype": re.compile(r"AggregateRating|Review", re.I)}):
-        return True
-
-    review_classes = re.compile(
-        r"(bv-rating|yotpo-bottomline|jdgm-widget|spr-badge|stamped-summary|pr-snippet|trustpilot-widget|review-stars|star-rating|product-reviews|rating-summary)", 
-        re.I
-    )
+    if soup.find(attrs={"itemprop": re.compile(r"aggregateRating|review", re.I)}): return True
+    review_classes = re.compile(r"(bv-rating|yotpo-bottomline|jdgm-widget|spr-badge|stamped-summary|trustpilot-widget)", re.I)
+    
     for tag in soup.find_all(['div', 'span', 'section']):
-        classes = tag.get('class', [])
-        if not isinstance(classes, list): classes = [classes]
-        class_string = " ".join(classes).lower()
-        id_string = tag.get('id', '').lower()
-        if review_classes.search(class_string) or review_classes.search(id_string):
-            return True
+        classes = " ".join(tag.get('class', [])).lower() if isinstance(tag.get('class'), list) else tag.get('class', '')
+        if review_classes.search(str(classes)) or review_classes.search(str(tag.get('id', ''))): return True
 
-    for script_or_style in soup(['script', 'style']):
-        script_or_style.decompose()
-        
     visible_text = soup.get_text(separator=' ', strip=True).lower()
-    if re.search(r"\(?\b\d+\b\)?\s*(recensioni|recensione|reviews|review)\b", visible_text):
-         return True
-    if re.search(r"\b[0-5][.,][0-9]\s*(/|su)\s*5\b", visible_text):
-         return True
+    if re.search(r"\b[0-5][.,][0-9]\s*(/|su)\s*5\b", visible_text): return True
 
     return False
+
+def extract_trustpilot_data(page, base_url, api_key):
+    """Cerca il punteggio Trustpilot interrogando direttamente Trustpilot.com"""
+    try:
+        # Pulisci l'URL per ottenere solo il dominio (es. www.sephora.it)
+        domain = urlparse(base_url).netloc
+        if not domain: return "N/A", "0"
+        
+        tp_url = f"https://it.trustpilot.com/review/{domain}"
+        bypass_tp = f"http://api.scraperapi.com/?api_key={api_key}&url={quote(tp_url)}&render=true"
+        
+        page.goto(bypass_tp, timeout=60000, wait_until="domcontentloaded")
+        page.wait_for_timeout(2000)
+        
+        tp_html = page.content()
+        soup = BeautifulSoup(tp_html, "html.parser")
+        
+        # Cerca i dati strutturati di Trustpilot
+        score = "N/A"
+        reviews_count = "0"
+        
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, list): data = data[0]
+                if data.get("@type") == "LocalBusiness" and "aggregateRating" in data:
+                    score = str(data["aggregateRating"].get("ratingValue", "N/A"))
+                    reviews_count = str(data["aggregateRating"].get("reviewCount", "0"))
+                    return score, reviews_count
+            except:
+                pass
+                
+        # Fallback euristico se non c'è JSON-LD
+        score_tag = soup.find("p", {"data-rating-typography": "true"})
+        if score_tag: score = score_tag.text.strip()
+        
+        return score, reviews_count
+    except Exception as e:
+        return "N/A", "0"
 
 def check_ecommerce_optimized(base_url):
     combined_html = ""
     error_log = ""
     API_KEY = os.environ.get("SCRAPER_API_KEY")
     
+    if not API_KEY:
+        return False, "Sconosciuta", "N/A", "0", "ERRORE: API_KEY mancante in Railway"
+        
+    if not base_url.startswith('http'): base_url = 'https://' + base_url
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled'
-            ]
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
         )
         try:
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080},
-                locale="it-IT"
-            )
+            context = browser.new_context(viewport={"width": 1920, "height": 1080}, locale="it-IT")
             page = context.new_page()
             
+            # --- 1. NAVIGAZIONE E-COMMERCE ---
             try:
-                # ABBIAMO AGGIUNTO IL PARAMETRO premium=true
-                encoded_base_url = quote(base_url)
-                bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={encoded_base_url}&render=true&premium=true&country_code=it"
-                
-                # I server premium ci mettono un attimo in più a risolvere, diamo 90 secondi
+                bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={quote(base_url)}&render=true&premium=true&country_code=it"
                 page.goto(bypass_url, timeout=90000, wait_until="domcontentloaded")
                 page.wait_for_timeout(3000) 
                 
-                page_title = page.title()
                 homepage_html = page.content()
                 combined_html += homepage_html
                 
-                raw_links = page.evaluate("""() => {
-                    return Array.from(document.querySelectorAll('a')).map(a => a.getAttribute('href')).filter(h => h);
-                }""")
+                raw_links = page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => a.getAttribute('href')).filter(h => h)")
+                keywords = ['/product/', '/products/', '/prodotto/', '/p/', '.html']
+                valid_links = [urljoin(base_url, h) for h in raw_links if any(k in h.lower() for k in keywords) and h != '/' and not h.startswith('#')][:2]
                 
-                keywords = ['/product/', '/products/', '/prodotto/', '/prodotti/', '/p/', '/item/', '/sku/', '-p-']
-                exclude = ['/cart', '/login', '/account', '/checkout', '/wishlist', '/category/', '/brand/', '/privacy', '/terms', '/faq']
-                
-                valid_links = []
-                for href in raw_links:
-                    href_lower = href.lower()
-                    if any(ex in href_lower for ex in exclude): continue
-                    if href_lower == base_url.lower() or href_lower == '/': continue
-                    
-                    if any(k in href_lower for k in keywords) or (href_lower.endswith('.html') and len(href) > 20):
-                        valid_links.append(urljoin(base_url, href))
-                
-                product_links = list(set(valid_links))[:2]
-                
-                if not product_links:
-                    try:
-                        visible_text = page.evaluate("document.body.innerText.substring(0, 150)")
-                        visible_text = visible_text.replace('\n', ' ').strip()
-                    except:
-                        visible_text = "Impossibile leggere il testo"
-                        
-                    error_log += f" [Nessun Prodotto Trovato: Titolo='{page_title}' | Testo='{visible_text}'] "
-                    
             except Exception as e:
-                error_log = f"Errore navigazione Bypass API: {str(e)}"
-                return False, "Sconosciuta", error_log
+                error_log = f"Errore Homepage: {str(e)}"
                 
-            for p_url in product_links:
+            # --- 2. PRODOTTI ---
+            for p_url in valid_links:
                 try:
-                    # AGGIUNTO premium=true ANCHE AI PRODOTTI
-                    encoded_p_url = quote(p_url)
-                    p_bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={encoded_p_url}&render=true&premium=true&country_code=it"
-                    
+                    p_bypass_url = f"http://api.scraperapi.com/?api_key={API_KEY}&url={quote(p_url)}&render=true&premium=true&country_code=it"
                     page.goto(p_bypass_url, timeout=90000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(4000) 
+                    page.wait_for_timeout(3000) 
                     combined_html += page.content()
                 except Exception as e:
-                    error_log += f" | Timeout su prodotto ({p_url})"
+                    error_log += f" | Timeout Prodotto"
+            
+            # --- 3. ESTRAZIONE TRUSTPILOT ---
+            tp_score, tp_reviews = extract_trustpilot_data(page, base_url, API_KEY)
                     
         except Exception as global_e:
-             return False, "Sconosciuta", f"Errore Core: {str(global_e)}"
+             return False, "Sconosciuta", "N/A", "0", f"Errore Core: {str(global_e)}"
         finally:
             browser.close()
             
     widget_presente = detect(combined_html)
     piattaforma = detect_platform(combined_html)
     
-    return widget_presente, piattaforma, error_log
+    return widget_presente, piattaforma, tp_score, tp_reviews, error_log
 
 @app.route('/', methods=['GET'])
 def home():
-    return "✅ Server VIVO e PREMIUM PROXY ATTIVATI."
+    return "✅ Server VIVO - Motore E-commerce + Trustpilot ATTIVATO."
 
 @app.route('/api/check', methods=['POST'])
 @app.route('/api/check/', methods=['POST'])
@@ -191,23 +167,22 @@ def api_single_check():
         return jsonify({'error': 'URL mancante'}), 400
     
     url = data['url'].strip()
-    if not url.startswith('http://') and not url.startswith('https://'):
-        url = 'https://' + url
     
     try:
-        has_widget, platform, log = check_ecommerce_optimized(url)
+        has_widget, platform, tp_score, tp_reviews, log = check_ecommerce_optimized(url)
         response_data = {
             'widget_presente': has_widget,
-            'piattaforma': platform
+            'piattaforma': platform,
+            'trustpilot_score': tp_score,
+            'trustpilot_reviews': tp_reviews
         }
         if log:
             response_data['internal_log'] = log.strip()
             
         return jsonify(response_data)
     except Exception as e:
-        return jsonify({'widget_presente': False, 'piattaforma': 'Sconosciuta', 'error': str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    import os
     port = int(os.environ.get('PORT', 8000))
     app.run(debug=False, host='0.0.0.0', port=port)
