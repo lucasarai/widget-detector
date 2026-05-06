@@ -106,7 +106,7 @@ def extract_trustpilot_data(page, base_url, api_key):
 def check_ecommerce_optimized(base_url):
     combined_html = ""
     error_log = ""
-    API_KEY = 60730861602c4b7fb98ec93607035e7d
+    API_KEY = "60730861602c4b7fb98ec93607035e7d"
     
     if not API_KEY:
         return False, "Sconosciuta", "N/A", "0", "ERRORE: API_KEY mancante in Railway"
